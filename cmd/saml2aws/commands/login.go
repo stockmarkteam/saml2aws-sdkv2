@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	b64 "encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -9,9 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/aws-sdk-go-v2/service/sts/types"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/versent/saml2aws/v2"
@@ -251,12 +253,6 @@ func resolveLoginDetails(account *cfg.IDPAccount, loginFlags *flags.LoginExecFla
 		loginDetails.MFAIPAddress = loginFlags.CommonFlags.MFAIPAddress
 	}
 
-	if loginFlags.DownloadBrowser {
-		loginDetails.DownloadBrowser = loginFlags.DownloadBrowser
-	} else if account.DownloadBrowser {
-		loginDetails.DownloadBrowser = account.DownloadBrowser
-	}
-
 	// parse KCBroker if set
 	if account.KCBroker != "" {
 		loginDetails.KCBroker = account.KCBroker
@@ -356,21 +352,20 @@ func resolveRole(awsRoles []*saml2aws.AWSRole, samlAssertion string, account *cf
 }
 
 func loginToStsUsingRole(account *cfg.IDPAccount, role *saml2aws.AWSRole, samlAssertion string) (*awsconfig.AWSCredentials, error) {
+	ctx := context.Background()
 
-	sess, err := session.NewSession(&aws.Config{
-		Region: &account.Region,
-	})
+	awsCfg, err := loadAnonymousSTSConfig(ctx, account.Region)
 	if err != nil {
-		return nil, errors.Wrap(err, "Failed to create session.")
+		return nil, errors.Wrap(err, "Failed to load AWS config.")
 	}
 
-	svc := sts.New(sess)
+	svc := sts.NewFromConfig(awsCfg)
 
 	params := &sts.AssumeRoleWithSAMLInput{
 		PrincipalArn:    aws.String(role.PrincipalARN), // Required
 		RoleArn:         aws.String(role.RoleARN),      // Required
 		SAMLAssertion:   aws.String(samlAssertion),     // Required
-		DurationSeconds: aws.Int64(int64(account.SessionDuration)),
+		DurationSeconds: aws.Int32(int32(account.SessionDuration)),
 	}
 
 	if account.PolicyFile != "" {
@@ -382,29 +377,50 @@ func loginToStsUsingRole(account *cfg.IDPAccount, role *saml2aws.AWSRole, samlAs
 	}
 
 	if account.PolicyARNs != "" {
-		var arns []*sts.PolicyDescriptorType
+		var arns []types.PolicyDescriptorType
 		for _, arn := range strings.Split(account.PolicyARNs, ",") {
-			arns = append(arns, &sts.PolicyDescriptorType{Arn: aws.String(arn)})
+			arns = append(arns, types.PolicyDescriptorType{Arn: aws.String(arn)})
 		}
 		params.PolicyArns = arns
 	}
 
 	log.Println("Requesting AWS credentials using SAML assertion.")
 
-	resp, err := svc.AssumeRoleWithSAML(params)
+	resp, err := svc.AssumeRoleWithSAML(ctx, params)
 	if err != nil {
 		return nil, errors.Wrap(err, "Error retrieving STS credentials using SAML.")
 	}
 
 	return &awsconfig.AWSCredentials{
-		AWSAccessKey:     aws.StringValue(resp.Credentials.AccessKeyId),
-		AWSSecretKey:     aws.StringValue(resp.Credentials.SecretAccessKey),
-		AWSSessionToken:  aws.StringValue(resp.Credentials.SessionToken),
-		AWSSecurityToken: aws.StringValue(resp.Credentials.SessionToken),
-		PrincipalARN:     aws.StringValue(resp.AssumedRoleUser.Arn),
-		Expires:          resp.Credentials.Expiration.Local(),
+		AWSAccessKey:     aws.ToString(resp.Credentials.AccessKeyId),
+		AWSSecretKey:     aws.ToString(resp.Credentials.SecretAccessKey),
+		AWSSessionToken:  aws.ToString(resp.Credentials.SessionToken),
+		AWSSecurityToken: aws.ToString(resp.Credentials.SessionToken),
+		PrincipalARN:     aws.ToString(resp.AssumedRoleUser.Arn),
+		Expires:          aws.ToTime(resp.Credentials.Expiration).Local(),
 		Region:           account.Region,
 	}, nil
+}
+
+// loadAnonymousSTSConfig loads the AWS config used for AssumeRoleWithSAML.
+// That call is unsigned, so credentials are never resolved; the config is
+// loaded only to honour env settings such as AWS_CA_BUNDLE and endpoint
+// overrides. On a first login AWS_PROFILE often names the profile saml2aws
+// is about to create, which makes LoadDefaultConfig fail, so in that case we
+// fall back to a bare config with just the region.
+func loadAnonymousSTSConfig(ctx context.Context, region string) (aws.Config, error) {
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region), config.WithDefaultRegion(stsGlobalRegion))
+	if err == nil {
+		return awsCfg, nil
+	}
+	var notExist config.SharedConfigProfileNotExistError
+	if errors.As(err, &notExist) {
+		if region == "" {
+			region = stsGlobalRegion
+		}
+		return aws.Config{Region: region}, nil
+	}
+	return aws.Config{}, err
 }
 
 func saveCredentials(awsCreds *awsconfig.AWSCredentials, sharedCreds *awsconfig.CredentialsProvider) error {
