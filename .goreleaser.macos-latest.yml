@@ -20,7 +20,6 @@ builds:
 archives:
   - format: tar.gz
     wrap_in_directory: false
-    # remove README and LICENSE
     files:
       - LICENSE.md
       - README.md
