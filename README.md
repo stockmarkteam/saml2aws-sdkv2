@@ -5,24 +5,191 @@ AWS SDK for Go v1 with **[AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v
 
 Commands, identity providers, configuration files and flags are unchanged. If you already use saml2aws, this is a drop-in replacement. The few behaviour differences are listed [below](#behaviour-differences-from-upstream); please read them before you roll this out.
 
-> **Not affiliated with Versent.** This fork is maintained separately. Please report problems with this build
-> [here](https://github.com/stockmarkteam/saml2aws-sdkv2/issues), not on the upstream tracker.
+**Not affiliated with Versent.** This fork is maintained separately. Please report problems with this build
+[here](https://github.com/stockmarkteam/saml2aws-sdkv2/issues), not on the upstream tracker.
 
-- [Why this fork](#why-this-fork)
-- [What changed](#what-changed)
-- [Behaviour differences from upstream](#behaviour-differences-from-upstream)
-- [Install](#install)
-- [Build from source](#build-from-source)
-- [Usage](#usage)
-- [Versioning](#versioning)
+## Table of Contents
+
+- [saml2aws](#saml2aws)
+  - [Table of Contents](#table-of-contents)
+  - [Archirecture](#architecture)
+  - [Login Pipeline](#login-pipeline)
+  - [Auth Mechanism](#auth-mechanism)
+  - [Auth Flows](#auth-flows)
+  - [Requirements](#requirements)
+  - [Caveats](#caveats)
+  - [Install](#install)
+    - [macOS](#macOS)
+    - [Windows](#windows)
+    - [Linux](#linux)
+      - [Ubuntu](#ubuntu)
+      - [Other](#other)
+      - [Using Make](#using-make)
+      - [Arch Linux and its derivatives](#arch-linux-and-its-derivatives)
+      - [Void Linux](#void-linux)
+  - [Autocomplete](#autocomplete)
+    - [Bash](#bash)
+    - [Zsh](#zsh)
+  - [Dependency Setup](#dependency-setup)
+  - [Usage](#usage)
+    - [`saml2aws script`](#saml2aws-script)
+    - [`saml2aws exec`](#saml2aws-exec)
+    - [Configuring IDP Accounts](#configuring-idp-accounts)
+  - [Example](#example)
+  - [Advanced Configuration](#advanced-configuration)
+    - [Windows Subsystem Linux (WSL) Configuration](#windows-subsystem-linux-wsl-configuration)
+      - [Option 1: Disable Keychain](#option-1-disable-keychain)
+      - [Option 2: Configure Pass to be the default keyring](#option-2-configure-pass-to-be-the-default-keyring)
+    - [Configuring Multiple Accounts](#configuring-multiple-accounts)
+      - [Dev Account Setup](#dev-account-setup)
+      - [Test Account Setup](#test-account-setup)
+  - [Advanced Configuration (Multiple AWS account access but SAML authenticate against a single 'SSO' AWS account)](#advanced-configuration-multiple-aws-account-access-but-saml-authenticate-against-a-single-sso-aws-account)
+  - [Advanced Configuration - additional parameters](#advanced-configuration---additional-parameters)
+  - [Building](#building)
+    - [macOS](#macos)
+    - [Linux](#linux-1)
+  - [Environment vars](#environment-vars)
+- [Dependencies](#dependencies)
+- [Releasing](#releasing)
+- [Debugging Issues with IDPs](#debugging-issues-with-idps)
+- [Using saml2aws as credential process](#using-saml2aws-as-credential-process)
+- [Caching the saml2aws SAML assertion for immediate reuse](#caching-the-saml2aws-saml-assertion-for-immediate-reuse)
+- [Okta Sessions](#okta-sessions)
 - [License](#license)
 
-## Why this fork
+## Architecture
+This diagram shows saml2aws as a single process (dashed boundary) made of six layers that a request passes through from top to bottom.
 
-- **AWS SDK for Go v1 reached end-of-support on July 31, 2025.** It no longer gets bug fixes or security updates.
-  saml2aws only uses it for AWS STS calls, so the migration is small. This fork does that migration.
-- **The Go toolchain is current.** Upstream declares Go 1.21 with toolchain 1.22.5, so its builds miss two years of
-  standard-library security fixes (TLS, `net/http`, `crypto/*`).
+![saml2aws system architecture](img/saml2aws_system_architecture.png)
+
+#### CLI commands
+The kingpin command layer parses one of six commands: login, exec, console, script, list-roles and configure.
+#### Account and flag resolver
+ This layer (pkg/cfg, pkg/flags, prompter) merges the named IdP account from ~/.saml2aws with any command-line flags and SAML2AWS_* environment variables.
+#### Login orchestrator
+ It checks whether the current AWS credentials are still valid. If not, it looks up the saved password in the OS keychain, consults the optional SAML cache file, and hands off to an identity provider (IdP) implementation.
+#### SAMLClient providers
+ Twenty provider implementations sit behind a two-method interface, Validate() and Authenticate(). They are the only code that talks to the IdP, and each returns a base64-encoded SAML response.
+ #### Role resolver and STS client
+ This layer reads the AWS roles listed in the assertion. When there are several, it POSTs the assertion to the AWS sign-in /saml endpoint to get readable account names. It then calls STS AssumeRoleWithSAML.
+####  Output writers
+These deliver the temporary credentials in the form the command needs: a profile in ~/.aws/credentials, environment variables for a child process or an export script, or a federated console sign-in URL.
+
+Color marks where each piece lives. Gray boxes are local resources on the user’s machine, teal boxes are remote services reached over HTTPS, and purple boxes are internal components. The key design point is that everything IdP-specific is confined to the provider layer; every other layer is shared by all providers.
+
+## Login Pipeline
+This diagram traces the login command, the path that turns an IdP sign-in into AWS credentials.
+
+![saml2aws login pipeline](img/saml2aws_login_pipeline.png)
+
+#### Load the IdP account
+The account is loaded from ~/.saml2aws, with flags and environment variables applied on top.
+
+#### Check existing credentials
+If the stored credentials’ expiry (x_security_token_expires) hasn’t passed, the command stops early unless --force is given.
+
+#### Resolve login details
+Credentials come from the keychain first, then flags, then interactive prompts.
+
+#### Build the provider
+The provider is instantiated and validated, including whether the configured MFA type is allowed for it.
+
+#### Authenticate
+This is the one step that differs by provider. If --cache-saml is enabled and a cached assertion is still within its validity window, the cache is used instead and the IdP isn’t contacted (dashed arrow).
+
+#### Extract roles
+After a successful authentication the password is saved back to the keychain, and the AWS role/principal pairs are read from the assertion.
+
+#### Choose a role
+The role comes from --role, is selected automatically if there’s only one, or is picked from a prompt. When several roles exist, the assertion is POSTed to AWS’s sign-in page to get account names.
+
+#### Assume the role
+STS AssumeRoleWithSAML is called, honoring the session duration and any session policy.
+Persist the credentials. They’re written either as a profile in ~/.aws/credentials or as credential_process JSON on stdout.
+
+Teal steps make network calls to the IdP or AWS. Purple steps run locally.
+
+Other commands reuse parts of this path. list-roles runs through role extraction and then prints the roles instead of calling STS. console runs the full pipeline when its credentials are missing, expired or rejected. exec runs it only when credentials look current but STS rejects them.
+
+
+## Auth Mechanism
+This diagram groups the 20 providers by how they obtain the SAML assertion. The technique, more than the vendor, determines a provider’s behavior, how fragile it is, and its security properties. Purple cards are headless: saml2aws speaks the IdP’s protocol itself and prompts for credentials and MFA in the terminal.
+
+![saml2aws auth mechanism](img/saml2aws_auth_mechanism_families.png)
+
+#### HTML form scraping
+HTML form scraping (ADFS, KeyCloak, Ping, PingOne, Shibboleth, F5APM, NetIQ, GoogleApps) fetches login pages, parses forms with goquery, and posts them back using a cookie jar. These providers break when the IdP redesigns its login pages.
+
+#### Vendor REST APIs
+Vendor REST APIs (Okta, OneLogin, JumpCloud, Authentik, Akamai, Auth0) call the vendor’s JSON authentication and MFA endpoints. This is generally more stable than scraping.
+
+#### The Azure AD flow
+The Azure AD flow is a state machine. It reads the page-type configuration embedded in each Microsoft sign-in page and handles each step accordingly: credential entry, two-factor, “stay signed in” (KMSI), and posting the SAMLRequest.
+
+####  NTLM negotiation
+NTLM negotiation (ADFS2, PingNTLM) runs the NTLM handshake over HTTP using the typed username and password. The card’s “Windows integrated auth” label is misleading: these providers don’t use the logged-in Windows session, and they run on macOS and Linux too. Windows only matters on the server side. ADFS2 optionally adds an RSA SecurID step.
+
+#### SAML ECP
+SAML ECP (ShibbolethECP) uses SAML’s non-browser Enhanced Client or Proxy profile. It sends a SOAP AuthnRequest with HTTP Basic credentials and passes Duo factors in a request header.
+Coral cards are delegated: something else performs the login and saml2aws only collects the assertion.
+
+#### Real Browser
+The Browser provider launches a real browser through Playwright. Because the user signs in in an actual browser, it works with any IdP and any MFA, including security keys with their origin binding intact.
+The Shell provider runs a user-supplied executable and treats its stdout as the base64 SAML response. This makes it the extension point for IdPs saml2aws doesn’t support.
+
+
+## Auth Flows
+This diagram compares three providers that represent the main mechanisms, each shown as four steps in a column. All three end in the same place: a base64 SAMLResponse handed to the shared pipeline for role selection, STS and persistence.
+
+![saml2aws auth flows](img/saml2aws_okta_browser_ecp_flows.png)
+
+#### Okta (REST API)
+The Okta column is the API-driven headless flow.
+
+ 1. If a previous run left an Okta session cookie (sid) in the keychain and it’s still valid, the flow jumps straight to the app.
+ 2. Otherwise it POSTs the username and password to /api/v1/authn.
+ 3. It completes whichever MFA factor Okta requires, such as push, TOTP, Duo or FIDO.
+ 4. It uses the resulting session token to follow the AWS app’s embed URL, then scrapes the SAMLResponse from the auto-submit form Okta returns.
+
+#### Browser (Playwright)
+The Browser column is the delegated flow.
+
+ 1. saml2aws launches a Playwright-controlled browser, either a downloaded build or a configured system browser.
+ 2. It opens the IdP URL, optionally autofilling the username and password.
+ 3. The user signs in and completes MFA in the page.
+ 4. saml2aws intercepts the browser’s POST to the AWS SAML sign-in endpoint and reads the assertion from the request body. It never parses the IdP’s pages, which is why this provider survives IdP UI changes.
+
+
+#### ShibbolethECP
+The ShibbolethECP column is the standards-based non-browser flow.
+
+ 1. saml2aws builds a SOAP-wrapped AuthnRequest using the PAOS binding.
+ 2. It POSTs the request to the IdP’s ECP endpoint with HTTP Basic credentials and a Duo factor header.
+ 3. Duo push, phone call or passcode is completed out of band.
+ 4. saml2aws unwraps the SOAP response, checks that its status is Success, and base64-encodes the assertion.
+
+The comparison shows the main trade-off. The headless Okta and ECP flows can run without a desktop browser but must understand the IdP’s protocol and MFA. The browser flow needs a GUI but works with any IdP and MFA.
+
+
+## Requirements
+
+* One of the supported Identity Providers
+  * ADFS (2.x or 3.x)
+  * [AzureAD](doc/provider/aad/README.md)
+  * PingFederate + PingId
+  * [Okta](pkg/provider/okta/README.md)
+  * KeyCloak + (TOTP)
+  * [Google Apps](pkg/provider/googleapps/README.md)
+  * [Shibboleth](pkg/provider/shibboleth/README.md)
+  * [F5APM](pkg/provider/f5apm/README.md)
+  * [Akamai](pkg/provider/akamai/README.md)
+  * OneLogin
+  * NetIQ
+  * Browser, this uses [playwright-go](github.com/playwright-community/playwright-go) to run a sandbox chromium window.
+  * [Auth0](pkg/provider/auth0/README.md) NOTE: Currently, MFA not supported
+  * [JumpCloud](doc/provider/jumpcloud/README.md)
+* AWS SAML Provider configured
+
 
 ## What changed
 
