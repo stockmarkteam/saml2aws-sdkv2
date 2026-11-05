@@ -1,15 +1,16 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	"github.com/pkg/errors"
 	"github.com/versent/saml2aws/v2/pkg/awsconfig"
 	"github.com/versent/saml2aws/v2/pkg/flags"
@@ -79,61 +80,69 @@ func Exec(execFlags *flags.LoginExecFlags, cmdline []string) error {
 // This is extremely useful in the case of a central "authentication account" which then requires secondary, and
 // often tertiary, role assumptions to acquire credentials for the target role.
 func assumeRoleWithProfile(targetProfile string, sessionDuration int) (*awsconfig.AWSCredentials, error) {
-	// AWS session config with verbose errors on chained credential errors
-	config := *aws.NewConfig().WithCredentialsChainVerboseErrors(true)
+	ctx := context.Background()
 	duration, _ := time.ParseDuration(strconv.Itoa(sessionDuration) + "s")
 
-	// a session forcing usage of the aws config file, sets the target profile which will be found in the config
-	sess := session.Must(session.NewSessionWithOptions(session.Options{
-		Config:             config,
-		Profile:            targetProfile,
-		SharedConfigState:  session.SharedConfigEnable,
-		AssumeRoleDuration: duration,
-	}))
+	// load ~/.aws/config and ~/.aws/credentials for the target profile; the SDK resolves
+	// role_arn / source_profile chains itself
+	awsCfg, err := config.LoadDefaultConfig(ctx,
+		config.WithSharedConfigProfile(targetProfile),
+		config.WithDefaultRegion(stsGlobalRegion),
+		config.WithAssumeRoleCredentialOptions(func(o *stscreds.AssumeRoleOptions) {
+			// as with SDK v1's AssumeRoleDuration, a non-zero --session-duration overrides
+			// duration_seconds from the profile
+			if duration > 0 {
+				o.Duration = duration
+			}
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	// use an STS client to perform the multiple role assumptions
-	stsClient := sts.New(sess)
-	input := &sts.GetCallerIdentityInput{}
-	_, err := stsClient.GetCallerIdentity(input)
-	if err != nil {
+	stsClient := sts.NewFromConfig(awsCfg)
+	if _, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{}); err != nil {
 		return nil, err
 	}
 
-	creds, err := sess.Config.Credentials.Get()
+	// served from the credentials cache populated by the call above
+	creds, err := awsCfg.Credentials.Retrieve(ctx)
 	if err != nil {
 		return nil, err
 	}
-	expiredAt, err := sess.Config.Credentials.ExpiresAt()
-	if err != nil {
-		return nil, err
+	if !creds.CanExpire {
+		return nil, fmt.Errorf("credentials for profile %s do not expire; expected temporary role credentials", targetProfile)
 	}
 
 	return &awsconfig.AWSCredentials{
 		AWSAccessKey:    creds.AccessKeyID,
 		AWSSecretKey:    creds.SecretAccessKey,
 		AWSSessionToken: creds.SessionToken,
-		Expires:         expiredAt,
+		Expires:         creds.Expires,
 	}, nil
 }
 
 func checkToken(profile string) (bool, error) {
-	sess, err := session.NewSessionWithOptions(session.Options{
-		Profile: profile,
-	})
+	ctx := context.Background()
+
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile), config.WithDefaultRegion(stsGlobalRegion))
 	if err != nil {
+		// profile not written yet: treat like v1's NoCredentialProviders and log in
+		var notExist config.SharedConfigProfileNotExistError
+		if errors.As(err, &notExist) {
+			return false, nil
+		}
 		return false, err
 	}
 
-	svc := sts.New(sess)
+	svc := sts.NewFromConfig(awsCfg)
 
-	params := &sts.GetCallerIdentityInput{}
-
-	_, err = svc.GetCallerIdentity(params)
+	_, err = svc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			if awsErr.Code() == "ExpiredToken" || awsErr.Code() == "NoCredentialProviders" {
-				return false, nil
-			}
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "ExpiredToken" {
+			return false, nil
 		}
 
 		return false, err
