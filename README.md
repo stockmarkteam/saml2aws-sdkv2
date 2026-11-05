@@ -245,8 +245,7 @@ created yet, it logs in again, the same as upstream. Other credential errors (fo
 ### 4. Go 1.26 TLS defaults
 
 Building with a current Go version turns on its stricter TLS defaults: TLS 1.2 minimum, no RSA key exchange and no 3DES.
-Modern identity providers aren't affected. If an old on-premises ADFS or Shibboleth server stops working, rebuild with
-a `godebug` block in `go.mod`, for example:
+Modern identity providers aren't affected. If an old on-premises ADFS or Shibboleth server stops working, rebuild with a `godebug` block in `go.mod`, for example:
 
 ```
 godebug (
