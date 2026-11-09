@@ -263,6 +263,7 @@ Pre-built binaries are attached to each [release](https://github.com/stockmarkte
 
 | File | Platform |
 |---|---|
+| `saml2aws_<version>_darwin_amd64.tar.gz`| Mac ARM64 (statix) |
 | `saml2aws_<version>_linux_amd64.tar.gz` | Linux x86-64 (static) |
 | `saml2aws_<version>_linux_arm64.tar.gz` | Linux ARM64 (static) |
 | `saml2aws-<version>-src.tar.gz` | Source |
