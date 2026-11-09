@@ -265,8 +265,6 @@ Pre-built binaries are attached to each [release](https://github.com/stockmarkte
 |---|---|
 | `saml2aws_<version>_linux_amd64.tar.gz` | Linux x86-64 (static) |
 | `saml2aws_<version>_linux_arm64.tar.gz` | Linux ARM64 (static) |
-| `saml2aws_<version>_windows_amd64.zip` | Windows x64 |
-| `saml2aws_<version>_windows_arm64.zip` | Windows ARM64 |
 | `saml2aws-<version>-src.tar.gz` | Source |
 | `SHA256SUMS` | Checksums for all of the above |
 
@@ -278,7 +276,7 @@ There's no macOS binary: macOS Keychain support needs cgo, so it can't be cross-
 ### Linux
 
 ```sh
-VERSION=2.36.19-sdkv2.1
+VERSION=2.36.19-sdkv2.0
 curl -LO https://github.com/stockmarkteam/saml2aws-sdkv2/releases/download/v${VERSION}/saml2aws_${VERSION}_linux_amd64.tar.gz
 curl -LO https://github.com/stockmarkteam/saml2aws-sdkv2/releases/download/v${VERSION}/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
@@ -287,20 +285,10 @@ sudo install -m 0755 saml2aws /usr/local/bin/saml2aws
 saml2aws --version
 ```
 
-### Windows (PowerShell)
-
-```powershell
-$Version = "2.36.19-sdkv2.1"
-Invoke-WebRequest "https://github.com/stockmarkteam/saml2aws-sdkv2/releases/download/v$Version/saml2aws_${Version}_windows_amd64.zip" -OutFile saml2aws.zip
-(Get-FileHash saml2aws.zip -Algorithm SHA256).Hash   # compare with SHA256SUMS
-Expand-Archive saml2aws.zip -DestinationPath "$env:LOCALAPPDATA\saml2aws"
-# add %LOCALAPPDATA%\saml2aws to your PATH
-```
-
 ### Replacing an existing upstream install
 
 Remove or unlink the upstream binary first so the right one is on your `PATH`
-(`brew uninstall saml2aws`, `choco uninstall saml2aws`, or delete the old binary). Your existing configuration and
+(`brew uninstall saml2aws`,  or delete the old binary). Your existing configuration and
 saved credentials keep working.
 
 ## Build from source
